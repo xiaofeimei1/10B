@@ -1,0 +1,11 @@
+---
+--- title: "10BData607" author: "XiaoFei" format: html editor: visual ---
+---
+
+## Approach
+
+This task is to use JSON data to investigate and answer four interesting, data-driven questions. First will need to establish connection to Nobel Prize organization's public APIs to access structured Nobel Prize data.
+
+The task requires questions should go beyond simple counts. I'll come up with questions requires filtering, joining or comparing fields.
+
+I'm interesting to investigate Nobel Prizes and gender distribution, or age distribution including if there is any trend to show ages increased over time or the other way around.

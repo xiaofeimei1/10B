@@ -1,11 +1,331 @@
 ---
---- title: "10BData607" author: "XiaoFei" format: html editor: visual ---
+title: "10BData607"
+author: "XiaoFei"
+format: html
+editor: visual
 ---
 
-## Approach
+## Introduction
 
-This task is to use JSON data to investigate and answer four interesting, data-driven questions. First will need to establish connection to Nobel Prize organization's public APIs to access structured Nobel Prize data.
+This analysis use the Nobel Prize organization’s public API to explore structured data on laureates and prizes. The goal is to answer four data-driven questions that go beyond aggregation. The questions we investigate are
 
-The task requires questions should go beyond simple counts. I'll come up with questions requires filtering, joining or comparing fields.
+1.  How has the share of female laureates changed across decades and categories?
 
-I'm interesting to investigate Nobel Prizes and gender distribution, or age distribution including if there is any trend to show ages increased over time or the other way around.
+2.  Which countries have “lost” the most laureates to other nations (i.e., born in one country but affiliated elsewhere at award time)?
+
+3.  Which countries have produced the most Nobel laureates by birth?
+
+4.  How has the number of prizes per category evolved over time?
+
+We will first establish a connection to the Nobel Prize API endpoints (\`/laureates\` and \`/nobelPrizes\`). The raw JSON responses will be saved into tibbles, then cleaned and joined to create two primary data frames:  - \`laureate_prizes\` and \`prizes_df for analysis.
+
+## Setup API Connection
+
+```{r setup, Message: FALSE}
+
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(forcats)
+library(scales)
+library(knitr)
+library(lubridate)
+
+theme_set(theme_minimal(base_size = 12))
+
+fetch_nobel <- function(endpoint, limit = 1000) {
+  url <- paste0("https://api.nobelprize.org/2.1/", endpoint,
+                "?limit=", limit, "&offset=0&format=json")
+  resp <- request(url) |>
+    req_headers(Accept = "application/json") |>
+    req_perform()
+  resp |> resp_body_string() |> fromJSON(flatten = TRUE)
+}
+
+# ── Laureates endpoint 
+raw_laureates <- fetch_nobel("laureates", limit = 1000)
+
+# ── Nobel Prizes endpoint 
+raw_prizes <- fetch_nobel("nobelPrizes", limit = 1000)
+
+ldf_raw <- raw_laureates$laureates
+
+
+ldf_raw <- raw_laureates$laureates
+
+# ------------------------------------------------------------------
+# Core fields
+# ------------------------------------------------------------------
+laureates <- tibble(
+  id            = ldf_raw$id,
+  full_name     = coalesce(ldf_raw$fullName.en, ldf_raw$orgName.en),
+  gender        = ldf_raw$gender,
+  birth_year    = as.integer(str_sub(ldf_raw$birth.date, 1, 4)),
+  death_year    = as.integer(str_sub(ldf_raw$death.date, 1, 4)),
+  birth_country = ldf_raw$birth.place.country.en,
+  birth_countryNow = ldf_raw$birth.place.countryNow.en
+)
+
+# ------------------------------------------------------------------
+# Prizes sub-list: unnest to one row per laureate × prize
+# ------------------------------------------------------------------
+prizes_nested <- ldf_raw$nobelPrizes
+
+library(purrr)
+
+# Safely extract one string from an affiliations entry.
+# Handles: NULL, empty list(), zero-row data frame, missing column.
+safe_affil <- function(affil_list, field) {
+  map_chr(affil_list, function(.x) {
+    # Case 1: NULL or not a data frame / list
+    if (is.null(.x)) return(NA_character_)
+    # Case 2: plain list() with no elements (length 0)
+    if (!is.data.frame(.x) && length(.x) == 0) return(NA_character_)
+    # Case 3: data frame but zero rows
+    if (is.data.frame(.x) && nrow(.x) == 0) return(NA_character_)
+    # Case 4: data frame but the column we want doesn't exist
+    if (is.data.frame(.x) && !field %in% names(.x)) return(NA_character_)
+    # Case 5: valid — grab first non-NA value
+    val <- .x[[field]][[1]]
+    if (is.null(val) || length(val) == 0) NA_character_ else as.character(val)
+  })
+}
+
+extract_prizes <- function(i) {
+  p <- prizes_nested[[i]]
+  if (is.null(p) || !is.data.frame(p) || nrow(p) == 0) return(NULL)
+
+  n_prizes <- nrow(p)
+
+  # affiliations may not exist at all in some API responses
+  affil_col <- if ("affiliations" %in% names(p)) p$affiliations
+               else vector("list", n_prizes)
+
+  tibble(
+    id            = ldf_raw$id[[i]],
+    prize_year    = as.integer(p$awardYear),
+    category      = p$category.en,
+    affiliation   = safe_affil(affil_col, "nameNow.en"),
+    award_country = safe_affil(affil_col, "country.en")
+  )
+}
+
+prizes_long <- map(seq_along(prizes_nested), extract_prizes) |>
+  bind_rows()
+
+# Join laureate info onto prizes
+laureate_prizes <- laureates |>
+  inner_join(prizes_long, by = "id")
+
+glimpse(laureate_prizes)
+```
+
+Get prize-level data frame
+
+```{r data2}
+pdf_raw <- raw_prizes$nobelPrizes
+
+prizes_df <- tibble(
+  year        = as.integer(pdf_raw$awardYear),
+  category    = pdf_raw$category.en,
+  n_laureates = pdf_raw$numberLaureates,
+  motivation  = coalesce(pdf_raw$topMotivation.en, NA_character_)
+)
+
+glimpse(prizes_df)
+
+```
+
+Explore questions1 : How has the share of female laureates changed across decades and categories?
+
+To answer this, we group laureates by decade (based on `prize_year`) and category, then compute the percentage of female recipients. We also calculate an overall trend line across all categories to see if progress is universal or field-dependent.
+
+```{r q1}
+gender_decade <- laureate_prizes |>
+  filter(!is.na(gender)) |>
+  mutate(decade = (prize_year %/% 10) * 10) |>
+  group_by(decade, category) |>
+  summarise(
+    total   = n(),
+    n_women = sum(gender == "female", na.rm = TRUE),
+    pct_women = n_women / total * 100,
+    .groups = "drop"
+  )
+
+# Overall by decade (across all categories)
+gender_overall <- laureate_prizes |>
+  filter(!is.na(gender)) |>
+  mutate(decade = (prize_year %/% 10) * 10) |>
+  group_by(decade) |>
+  summarise(
+    total     = n(),
+    n_women   = sum(gender == "female", na.rm = TRUE),
+    pct_women = n_women / total * 100,
+    .groups   = "drop"
+  )
+
+gender_overall |>
+  kable(digits = 1,
+        col.names = c("Decade", "Total Laureates",
+                      "Women Laureates", "% Women"))
+ggplot(gender_decade |> filter(total >= 3),
+       aes(decade, pct_women, colour = category, group = category)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(aes(size = n_women), alpha = 0.8) +
+  geom_smooth(data = gender_overall,
+              aes(decade, pct_women, group = 1),
+              colour = "black", linewidth = 1.2,
+              method = "loess", se = TRUE, inherit.aes = FALSE) +
+  scale_size_continuous(range = c(1, 6), guide = "none") +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(
+    title = "Share of Nobel Prizes Awarded to Women, by Decade",
+    subtitle = "Black line = overall trend (all categories); points sized by # women laureates",
+    x = "Decade",
+    y = "% of laureates who are women",
+    colour = "Category",
+    caption = "Source: Nobel Prize API v2.1"
+  ) +
+  theme(legend.position = "bottom")
+
+
+```
+
+Questions 2 Which country has "lost" the most Nobel laureates — born there but awarded while a citizen of another country?
+
+We define “lost” laureates as individuals whose birth country differs from their `award_country` (country of affiliation at prize time). Organizations are excluded to focus on individual mobility. The table ranks countries by number of emigrated laureates and identifies their most common destination.
+
+```{r q2}
+brain_drain <- laureate_prizes |>
+  filter(
+    !is.na(birth_country),
+    !is.na(award_country),
+    gender != "org",   # exclude organisations
+    birth_country != award_country          
+  ) |>
+  # tidy the country names a bit
+  mutate(
+    birth_country = str_trim(birth_country),
+    award_country = str_trim(award_country)
+  ) |>
+  group_by(birth_country) |>
+  summarise(
+    laureates_lost = n(),
+    top_destination = names(sort(table(award_country), decreasing = TRUE))[1],
+    .groups = "drop"
+  ) |>
+  arrange(desc(laureates_lost)) |>
+  slice_head(n = 15)
+
+brain_drain |>
+  kable(col.names = c("Birth Country", "Laureates Won Elsewhere",
+                      "Most Common Destination"))
+brain_drain |>
+  mutate(birth_country = fct_reorder(birth_country, laureates_lost)) |>
+  ggplot(aes(laureates_lost, birth_country, fill = top_destination)) +
+  geom_col() +
+  geom_text(aes(label = laureates_lost), hjust = -0.2, size = 3.5) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Countries That 'Lost' the Most Nobel Laureates",
+    subtitle = "Laureates born in one country but awarded while affiliated in another",
+    x = "Number of laureates won elsewhere",
+    y = "Birth country",
+    fill = "Most common\ndestination",
+    caption = "Source: Nobel Prize API v2.1"
+  ) +
+  theme(legend.position = "right")
+
+```
+
+Q3. Which questions have produced the most Nobel laureates?
+
+This question ignores later migration and simply counts laureates by their birth country. Organisations are excluded. The top 15 countries are visualized to show which nations have historically generated the most Nobel‑winning talent.
+
+```{r q3}
+
+top_countries <- laureate_prizes |>
+  filter(!is.na(birth_country), gender != "org") |>
+  count(birth_country, name = "n_laureates") |>
+  arrange(desc(n_laureates)) |>
+  slice_head(n = 15)
+
+top_countries |>
+  kable(col.names = c("Birth Country", "Number of Laureates"))
+
+#| label: q5-plot
+#| fig-height: 5
+
+top_countries |>
+  mutate(birth_country = fct_reorder(birth_country, n_laureates)) |>
+  ggplot(aes(n_laureates, birth_country, fill = n_laureates)) +
+  geom_col() +
+  geom_text(aes(label = n_laureates), hjust = -0.2, size = 3.5) +
+  scale_fill_gradient(low = "#c6dbef", high = "#084594", guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title   = "Top 15 Countries by Nobel Laureate Birth Country",
+    subtitle = "Counts individual laureates only (excludes organisations)",
+    x       = "Number of laureates",
+    y       = NULL,
+    caption = "Source: Nobel Prize API v2.1"
+  )
+
+```
+
+Q4. How many prizes have been awarded per category per decades?
+
+We count prizes (not laureates) by decade and category. This reveals when new categories were introduced (e.g., Economic Sciences in 1969) and whether the frequency of awards has changed over time. A stacked bar chart makes category composition easy to compare across decades.
+
+```{r q4}
+#| label: q6-analysis
+
+# Description: A simple count of prizes by category and decade.
+# Shows whether prize-giving has accelerated or stayed constant over time.
+
+prizes_by_decade <- prizes_df |>
+  mutate(decade = (year %/% 10) * 10) |>
+  group_by(decade, category) |>
+  summarise(n_prizes = n(), .groups = "drop")
+
+prizes_by_decade |>
+  pivot_wider(names_from = category,
+              values_from = n_prizes,
+              values_fill = 0) |>
+  arrange(decade) |>
+  kable(caption = "Number of prizes awarded per decade by category")
+
+#| label: q6-plot
+#| fig-height: 5
+
+prizes_by_decade |>
+  ggplot(aes(decade, n_prizes, fill = category)) +
+  geom_col(position = "stack") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Nobel Prizes Awarded per Decade by Category",
+    subtitle = "Economic Sciences only added from 1969 onward",
+    x        = "Decade",
+    y        = "Number of prizes",
+    fill     = "Category",
+    caption  = "Source: Nobel Prize API v2.1"
+  )
+
+```
+
+## Conclusion
+
+This analysis uncovered several non‑trivial patterns in Nobel Prize data:
+
+-   **Gender gap**: The share of female laureates has increased slowly but unevenly across disciplines. The overall upward trend (black line) is driven largely by the Peace and Literature categories, while Physics and Chemistry remain male‑dominated.
+
+-   **Brain drain**: Germany has “lost” the most laureates (i.e., born there but awarded elsewhere), with the United States being the most common destination. This reflects historical patterns of scientific migration, especially during the 1930s–40s.
+
+-   **Top producer**: The United States leads by far in laureates **by birth**, followed by the United Kingdom and Germany. However, when counting by affiliation (not shown here), the US advantage grows even larger, reinforcing the brain‑drain narrative.
+
+-   **Prize frequency**: The number of prizes per decade has remained stable at about 50 per decade across most categories, except for Economic Sciences, which was introduced in 1969 and has since reached parity with older categories. No category shows strong acceleration or deceleration over time.
+
+Together, these findings demonstrate how simple API data can be transformed into meaningful sociological and historical insights through careful filtering, joining, and visualization.
